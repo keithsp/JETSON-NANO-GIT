@@ -50,6 +50,14 @@ MQTT_COMMAND_ALIASES = {
     "NONE": "STOP",
 }
 
+COMMAND_COLORS = {
+    "FORWARD": (0, 200, 0),
+    "BACKWARD": (0, 140, 255),
+    "LEFT": (255, 200, 0),
+    "RIGHT": (255, 120, 0),
+    "STOP": (0, 0, 255),
+}
+
 
 class CommandState:
     def __init__(self):
@@ -131,6 +139,27 @@ def detect_markers(frame, aruco, dictionary, params, detector):
     else:
         corners, ids, _ = aruco.detectMarkers(frame, dictionary, parameters=params)
     return corners, ids
+
+
+def draw_mqtt_command_overlay(frame, active_command: str):
+    label = f"MQTT COMMAND: {active_command}"
+    box_left = 24
+    box_top = frame.shape[0] - 86
+    box_right = min(frame.shape[1] - 24, 420)
+    box_bottom = frame.shape[0] - 24
+
+    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (25, 25, 25), -1)
+    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (90, 90, 90), 2)
+    cv2.putText(frame, "CURRENT MQTT", (box_left + 14, box_top + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
+    cv2.putText(
+        frame,
+        label,
+        (box_left + 14, box_top + 52),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        COMMAND_COLORS.get(active_command, (40, 255, 255)),
+        2,
+    )
 
 
 def main():
@@ -243,7 +272,7 @@ def main():
             if not sent_this_frame:
                 ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_command))
 
-            cv2.putText(frame, f"CMD: {active_command}", (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
+            draw_mqtt_command_overlay(frame, active_command)
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
