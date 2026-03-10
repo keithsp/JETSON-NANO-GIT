@@ -2,7 +2,7 @@ import paho.mqtt.client as mqtt
 
 # BROKER = "test.mosquitto.org"
 # BROKER = "127.0.0.1"
-BROKER = "192.168.137.10"
+BROKER = "192.168.0.2"
 
 PORT = 1883
 TOPIC = "Some topic"
