@@ -24,17 +24,35 @@ MSG_START = 0x30
 MSG_TYPE = 0x01
 MSG_END = 0x31
 
-# Byte 10: one-byte failsafe command for MCU.
-# Bytes 11-12: two-byte command packet.
-COMMAND_TABLE = {
-    "STOP": (0x00, b"ST"),
-    "FORWARD": (0x11, b"FW"),
-    "BACKWARD": (0x12, b"BW"),
-    "LEFT": (0x13, b"LT"),
-    "RIGHT": (0x14, b"RT"),
+MOVEMENT_BITS = {
+    "forward": 0x01,
+    "backward": 0x02,
+    "left": 0x04,
+    "right": 0x08,
 }
 
-# Accept both WASD and arrow-key style command tokens from MQTT.
+TURRET_BITS = {
+    "up": 0x01,
+    "down": 0x02,
+    "left": 0x04,
+    "right": 0x08,
+}
+
+AUX_BITS = {
+    "trigger": 0x01,
+    "retrieval_in": 0x02,
+    "retrieval_out": 0x04,
+    "auto_mode": 0x08,
+}
+
+LEGACY_COMMAND_BITS = {
+    "STOP": {},
+    "FORWARD": {"movement": {"forward": True}},
+    "BACKWARD": {"movement": {"backward": True}},
+    "LEFT": {"movement": {"left": True}},
+    "RIGHT": {"movement": {"right": True}},
+}
+
 MQTT_COMMAND_ALIASES = {
     "W": "FORWARD",
     "UP": "FORWARD",
@@ -51,42 +69,112 @@ MQTT_COMMAND_ALIASES = {
 }
 
 
+def default_control_state():
+    return {
+        "mode": "manual",
+        "movement": {name: False for name in MOVEMENT_BITS},
+        "turret": {name: False for name in TURRET_BITS},
+        "trigger": False,
+        "retrieval": {
+            "in": False,
+            "out": False,
+        },
+    }
+
+
 class CommandState:
     def __init__(self):
         self._lock = threading.Lock()
-        self._command = "STOP"
+        self._state = default_control_state()
 
-    def set(self, value: str):
+    def set(self, value: dict):
         with self._lock:
-            self._command = value
+            self._state = value
 
-    def get(self) -> str:
+    def get(self) -> dict:
         with self._lock:
-            return self._command
+            return {
+                "mode": self._state["mode"],
+                "movement": dict(self._state["movement"]),
+                "turret": dict(self._state["turret"]),
+                "trigger": self._state["trigger"],
+                "retrieval": dict(self._state["retrieval"]),
+            }
 
 
-def parse_command_text(payload_text: str) -> str:
+def merge_group(target: dict, source: dict, valid_keys):
+    for key in valid_keys:
+        target[key] = bool(source.get(key, False))
+
+
+def parse_legacy_command(command_name: str) -> dict:
+    state = default_control_state()
+    mapped = LEGACY_COMMAND_BITS.get(command_name, {})
+    merge_group(state["movement"], mapped.get("movement", {}), MOVEMENT_BITS)
+    return state
+
+
+def parse_command_text(payload_text: str) -> dict:
     text = payload_text.strip()
     if not text:
-        return "STOP"
+        return default_control_state()
 
-    # Support JSON payload from dashboard: {"command":"FORWARD", ...}
     if text.startswith("{") and text.endswith("}"):
         try:
             data = json.loads(text)
-            if isinstance(data, dict):
-                text = str(data.get("command", "")).strip()
         except json.JSONDecodeError:
-            return "STOP"
+            return default_control_state()
 
-    return MQTT_COMMAND_ALIASES.get(text.upper(), "STOP")
+        if isinstance(data, dict):
+            if "command" in data:
+                command_name = MQTT_COMMAND_ALIASES.get(str(data.get("command", "")).strip().upper(), "STOP")
+                return parse_legacy_command(command_name)
+
+            state = default_control_state()
+            state["mode"] = "auto" if str(data.get("mode", "manual")).strip().lower() == "auto" else "manual"
+
+            movement = data.get("movement", {})
+            turret = data.get("turret", {})
+            retrieval = data.get("retrieval", {})
+
+            if isinstance(movement, dict):
+                merge_group(state["movement"], movement, MOVEMENT_BITS)
+            if isinstance(turret, dict):
+                merge_group(state["turret"], turret, TURRET_BITS)
+            if isinstance(retrieval, dict):
+                merge_group(state["retrieval"], retrieval, ("in", "out"))
+
+            state["trigger"] = bool(data.get("trigger", False))
+            return state
+
+    command_name = MQTT_COMMAND_ALIASES.get(text.upper(), "STOP")
+    return parse_legacy_command(command_name)
 
 
-def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, command_name: str) -> bytes:
+def encode_bitmask(group_state: dict, bit_table: dict) -> int:
+    mask = 0
+    for name, bit in bit_table.items():
+        if group_state.get(name, False):
+            mask |= bit
+    return mask
+
+
+def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, control_state: dict) -> bytes:
     cx = max(-32768, min(32767, int(cx)))
     cy = max(-32768, min(32767, int(cy)))
 
-    failsafe_byte, cmd2 = COMMAND_TABLE.get(command_name, COMMAND_TABLE["STOP"])
+    movement_mask = encode_bitmask(control_state["movement"], MOVEMENT_BITS)
+    turret_mask = encode_bitmask(control_state["turret"], TURRET_BITS)
+
+    aux_mask = 0
+    if control_state["trigger"]:
+        aux_mask |= AUX_BITS["trigger"]
+    if control_state["retrieval"].get("in", False):
+        aux_mask |= AUX_BITS["retrieval_in"]
+    if control_state["retrieval"].get("out", False):
+        aux_mask |= AUX_BITS["retrieval_out"]
+    if control_state["mode"] == "auto":
+        aux_mask |= AUX_BITS["auto_mode"]
 
     msg = bytearray(MSG_LEN)
     msg[0] = MSG_START
@@ -102,9 +190,9 @@ def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, comman
     msg[8] = obj_height & 0xFF
     msg[9] = (obj_height >> 8) & 0xFF
 
-    msg[10] = failsafe_byte
-    msg[11] = cmd2[0]
-    msg[12] = cmd2[1]
+    msg[10] = movement_mask
+    msg[11] = turret_mask
+    msg[12] = aux_mask
     msg[13] = 0
     msg[14] = MSG_END
     return bytes(msg)
@@ -133,6 +221,11 @@ def detect_markers(frame, aruco, dictionary, params, detector):
     return corners, ids
 
 
+def summarize_group(group_state: dict, idle_label: str) -> str:
+    active = [name.upper() for name, enabled in group_state.items() if enabled]
+    return "+".join(active) if active else idle_label
+
+
 def main():
     command_state = CommandState()
 
@@ -142,8 +235,8 @@ def main():
 
     def on_message(client, userdata, msg):
         payload_text = msg.payload.decode("utf-8", errors="ignore")
-        command_name = parse_command_text(payload_text)
-        command_state.set(command_name)
+        control_state = parse_command_text(payload_text)
+        command_state.set(control_state)
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.on_connect = on_connect
@@ -210,7 +303,7 @@ def main():
             )
 
             marker_corners, marker_ids = detect_markers(frame, aruco, dictionary, params, detector)
-            active_command = command_state.get()
+            active_control_state = command_state.get()
             sent_this_frame = False
 
             if marker_ids is not None and len(marker_ids) > 0:
@@ -230,20 +323,29 @@ def main():
                     )
                     cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
 
-                    packet = build_uart_message(cx, cy, OBJ_WIDTH, OBJ_HEIGHT, active_command)
+                    packet = build_uart_message(cx, cy, OBJ_WIDTH, OBJ_HEIGHT, active_control_state)
                     ser.write(packet)
                     sent_this_frame = True
 
-                    info_text = f"ID:{int(marker_id)} Center:({cx},{cy}) CMD:{active_command}"
+                    movement_text = summarize_group(active_control_state["movement"], "STOP")
+                    turret_text = summarize_group(active_control_state["turret"], "IDLE")
+                    mode_text = active_control_state["mode"].upper()
+                    info_text = f"ID:{int(marker_id)} Center:({cx},{cy}) MOVE:{movement_text} TUR:{turret_text} MODE:{mode_text}"
                     cv2.putText(frame, info_text, (40, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
             else:
                 cv2.putText(frame, "No markers detected", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Continuous UART fail-safe behavior: send default cx/cy when no target.
             if not sent_this_frame:
-                ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_command))
+                ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_control_state))
 
-            cv2.putText(frame, f"CMD: {active_command}", (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
+            movement_text = summarize_group(active_control_state["movement"], "STOP")
+            turret_text = summarize_group(active_control_state["turret"], "IDLE")
+            trigger_text = "FIRE" if active_control_state["trigger"] else "SAFE"
+            retrieval_text = summarize_group(active_control_state["retrieval"], "IDLE")
+            mode_text = active_control_state["mode"].upper()
+            overlay = f"MOVE:{movement_text} TUR:{turret_text} AUX:{trigger_text}/{retrieval_text} MODE:{mode_text}"
+            cv2.putText(frame, overlay, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 255, 255), 2)
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
