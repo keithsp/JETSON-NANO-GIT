@@ -29,26 +29,21 @@ CONTROL_MSG_END = 0x31
 JETSON_STATUS_STX = 0xAA
 JETSON_STATUS_PKT_SIZE = 15
 
-# Byte 10: one-byte failsafe command for MCU.
-# Bytes 11-12: two-byte command packet.
-COMMAND_TABLE = {
-    "STOP": (0x00, b"ST"),
-    "FORWARD": (0x11, b"FW"),
-    "BACKWARD": (0x12, b"BW"),
-    "LEFT": (0x13, b"LT"),
-    "RIGHT": (0x14, b"RT"),
-    "TURRET_UP": (0x21, b"TU"),
-    "TURRET_DOWN": (0x22, b"TD"),
-    "TURRET_LEFT": (0x23, b"TL"),
-    "TURRET_RIGHT": (0x24, b"TR"),
-    "TRIGGER": (0x31, b"FG"),
-    "RETRIEVAL_IN": (0x41, b"RI"),
-    "RETRIEVAL_OUT": (0x42, b"RO"),
-    "AUTO_MODE": (0x51, b"AU"),
-    "MANUAL_MODE": (0x52, b"MN"),
-}
+ROSM_MOVE_FORWARD = 0x01
+ROSM_MOVE_BACKWARD = 0x02
+ROSM_MOVE_LEFT = 0x04
+ROSM_MOVE_RIGHT = 0x08
 
-# Accept both WASD and arrow-key style command tokens from MQTT.
+ROSM_TURRET_UP = 0x01
+ROSM_TURRET_DOWN = 0x02
+ROSM_TURRET_LEFT = 0x04
+ROSM_TURRET_RIGHT = 0x08
+
+ROSM_AUX_TRIGGER = 0x01
+ROSM_AUX_RETRIEVAL_IN = 0x02
+ROSM_AUX_RETRIEVAL_OUT = 0x04
+ROSM_AUX_AUTO_MODE = 0x08
+
 MQTT_COMMAND_ALIASES = {
     "W": "FORWARD",
     "UP": "FORWARD",
@@ -87,21 +82,61 @@ RETRIEVAL_PRIORITY = (
 class CommandState:
     def __init__(self):
         self._lock = threading.Lock()
-        self._command = "STOP"
+        self._state = {
+            "movement_bits": 0,
+            "turret_bits": 0,
+            "aux_bits": 0,
+            "label": "STOP",
+        }
 
-    def set(self, value: str):
+    def set(self, value: dict):
         with self._lock:
-            self._command = value
+            self._state = value
 
-    def get(self) -> str:
+    def get(self) -> dict:
         with self._lock:
-            return self._command
+            return dict(self._state)
 
 
-def parse_command_text(payload_text: str) -> str:
+def command_to_state(command_name: str) -> dict:
+    state = {
+        "movement_bits": 0,
+        "turret_bits": 0,
+        "aux_bits": 0,
+        "label": command_name,
+    }
+
+    if command_name == "FORWARD":
+        state["movement_bits"] = ROSM_MOVE_FORWARD
+    elif command_name == "BACKWARD":
+        state["movement_bits"] = ROSM_MOVE_BACKWARD
+    elif command_name == "LEFT":
+        state["movement_bits"] = ROSM_MOVE_LEFT
+    elif command_name == "RIGHT":
+        state["movement_bits"] = ROSM_MOVE_RIGHT
+    elif command_name == "TURRET_UP":
+        state["turret_bits"] = ROSM_TURRET_UP
+    elif command_name == "TURRET_DOWN":
+        state["turret_bits"] = ROSM_TURRET_DOWN
+    elif command_name == "TURRET_LEFT":
+        state["turret_bits"] = ROSM_TURRET_LEFT
+    elif command_name == "TURRET_RIGHT":
+        state["turret_bits"] = ROSM_TURRET_RIGHT
+    elif command_name == "TRIGGER":
+        state["aux_bits"] = ROSM_AUX_TRIGGER
+    elif command_name == "RETRIEVAL_IN":
+        state["aux_bits"] = ROSM_AUX_RETRIEVAL_IN
+    elif command_name == "RETRIEVAL_OUT":
+        state["aux_bits"] = ROSM_AUX_RETRIEVAL_OUT
+    elif command_name == "AUTO_MODE":
+        state["aux_bits"] = ROSM_AUX_AUTO_MODE
+    return state
+
+
+def parse_command_text(payload_text: str) -> dict:
     text = payload_text.strip()
     if not text:
-        return "STOP"
+        return command_to_state("STOP")
 
     if text.startswith("{") and text.endswith("}"):
         try:
@@ -109,9 +144,9 @@ def parse_command_text(payload_text: str) -> str:
             if isinstance(data, dict):
                 return parse_command_payload(data)
         except json.JSONDecodeError:
-            return "STOP"
+            return command_to_state("STOP")
 
-    return MQTT_COMMAND_ALIASES.get(text.upper(), "STOP")
+    return command_to_state(MQTT_COMMAND_ALIASES.get(text.upper(), "STOP"))
 
 
 def first_active(group, priority_pairs):
@@ -124,39 +159,72 @@ def first_active(group, priority_pairs):
 
 
 def parse_command_payload(data: dict) -> str:
+    movement_bits = int(data.get("movement_bits", 0)) & 0xFF
+    turret_bits = int(data.get("turret_bits", 0)) & 0xFF
+    aux_bits = int(data.get("aux_bits", 0)) & 0xFF
+
+    if movement_bits or turret_bits or aux_bits:
+        labels = []
+        if movement_bits & ROSM_MOVE_FORWARD:
+            labels.append("FORWARD")
+        if movement_bits & ROSM_MOVE_BACKWARD:
+            labels.append("BACKWARD")
+        if movement_bits & ROSM_MOVE_LEFT:
+            labels.append("LEFT")
+        if movement_bits & ROSM_MOVE_RIGHT:
+            labels.append("RIGHT")
+        if turret_bits & ROSM_TURRET_UP:
+            labels.append("TURRET_UP")
+        if turret_bits & ROSM_TURRET_DOWN:
+            labels.append("TURRET_DOWN")
+        if turret_bits & ROSM_TURRET_LEFT:
+            labels.append("TURRET_LEFT")
+        if turret_bits & ROSM_TURRET_RIGHT:
+            labels.append("TURRET_RIGHT")
+        if aux_bits & ROSM_AUX_TRIGGER:
+            labels.append("TRIGGER")
+        if aux_bits & ROSM_AUX_RETRIEVAL_IN:
+            labels.append("RETRIEVAL_IN")
+        if aux_bits & ROSM_AUX_RETRIEVAL_OUT:
+            labels.append("RETRIEVAL_OUT")
+        if aux_bits & ROSM_AUX_AUTO_MODE:
+            labels.append("AUTO_MODE")
+        return {
+            "movement_bits": movement_bits,
+            "turret_bits": turret_bits,
+            "aux_bits": aux_bits,
+            "label": "+".join(labels) if labels else "STOP",
+        }
+
     text_command = str(data.get("command", "")).strip()
     if text_command:
-        return MQTT_COMMAND_ALIASES.get(text_command.upper(), "STOP")
+        return command_to_state(MQTT_COMMAND_ALIASES.get(text_command.upper(), "STOP"))
 
     movement_command = first_active(data.get("movement"), MOVEMENT_PRIORITY)
     if movement_command is not None:
-        return movement_command
+        return command_to_state(movement_command)
 
     turret_command = first_active(data.get("turret"), TURRET_PRIORITY)
     if turret_command is not None:
-        return turret_command
+        return command_to_state(turret_command)
 
     if data.get("trigger"):
-        return "TRIGGER"
+        return command_to_state("TRIGGER")
 
     retrieval_command = first_active(data.get("retrieval"), RETRIEVAL_PRIORITY)
     if retrieval_command is not None:
-        return retrieval_command
+        return command_to_state(retrieval_command)
 
     mode = str(data.get("mode", "")).strip().lower()
     if mode == "auto":
-        return "AUTO_MODE"
-    if mode == "manual":
-        return "MANUAL_MODE"
+        return command_to_state("AUTO_MODE")
 
-    return "STOP"
+    return command_to_state("STOP")
 
 
-def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, command_name: str) -> bytes:
+def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, control_state: dict) -> bytes:
     cx = max(-32768, min(32767, int(cx)))
     cy = max(-32768, min(32767, int(cy)))
-
-    failsafe_byte, cmd2 = COMMAND_TABLE.get(command_name, COMMAND_TABLE["STOP"])
 
     msg = bytearray(CONTROL_MSG_LEN)
     msg[0] = CONTROL_MSG_START
@@ -172,9 +240,9 @@ def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, comman
     msg[8] = obj_height & 0xFF
     msg[9] = (obj_height >> 8) & 0xFF
 
-    msg[10] = failsafe_byte
-    msg[11] = cmd2[0]
-    msg[12] = cmd2[1]
+    msg[10] = int(control_state.get("movement_bits", 0)) & 0xFF
+    msg[11] = int(control_state.get("turret_bits", 0)) & 0xFF
+    msg[12] = int(control_state.get("aux_bits", 0)) & 0xFF
     msg[13] = 0
     msg[14] = CONTROL_MSG_END
     return bytes(msg)
@@ -282,8 +350,7 @@ def main():
 
     def on_message(client, userdata, msg):
         payload_text = msg.payload.decode("utf-8", errors="ignore")
-        command_name = parse_command_text(payload_text)
-        command_state.set(command_name)
+        command_state.set(parse_command_text(payload_text))
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     mqtt_client.on_connect = on_connect
@@ -356,7 +423,7 @@ def main():
             )
 
             marker_corners, marker_ids = detect_markers(frame, aruco, dictionary, params, detector)
-            active_command = command_state.get()
+            active_control = command_state.get()
             sent_this_frame = False
 
             if marker_ids is not None and len(marker_ids) > 0:
@@ -376,20 +443,31 @@ def main():
                     )
                     cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
 
-                    packet = build_uart_message(cx, cy, OBJ_WIDTH, OBJ_HEIGHT, active_command)
+                    packet = build_uart_message(cx, cy, OBJ_WIDTH, OBJ_HEIGHT, active_control)
                     ser.write(packet)
                     sent_this_frame = True
 
-                    info_text = f"ID:{int(marker_id)} Center:({cx},{cy}) CMD:{active_command}"
+                    info_text = (
+                        f"ID:{int(marker_id)} Center:({cx},{cy}) "
+                        f"M:{active_control['movement_bits']:02X} "
+                        f"T:{active_control['turret_bits']:02X} "
+                        f"A:{active_control['aux_bits']:02X}"
+                    )
                     cv2.putText(frame, info_text, (40, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
             else:
                 cv2.putText(frame, "No markers detected", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Continuous UART fail-safe behavior: send default cx/cy when no target.
             if not sent_this_frame:
-                ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_command))
+                ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_control))
 
-            cv2.putText(frame, f"CMD: {active_command}", (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
+            status_text = (
+                f"M:{active_control['movement_bits']:02X} "
+                f"T:{active_control['turret_bits']:02X} "
+                f"A:{active_control['aux_bits']:02X} "
+                f"{active_control['label']}"
+            )
+            cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
