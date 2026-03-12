@@ -44,6 +44,15 @@ ROSM_AUX_RETRIEVAL_IN = 0x02
 ROSM_AUX_RETRIEVAL_OUT = 0x04
 ROSM_AUX_AUTO_MODE = 0x08
 
+STATE_MANUAL = "MANUAL"
+STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
+STATE_AUTO_TARGETING = "AUTO_TARGETING"
+STATE_ENUM_MAP = {
+    0x0: STATE_MANUAL,
+    0x1: STATE_AUTO_PATROLLING,
+    0x2: STATE_AUTO_TARGETING,
+}
+
 MQTT_COMMAND_ALIASES = {
     "W": "FORWARD",
     "UP": "FORWARD",
@@ -272,6 +281,9 @@ def parse_telemetry_packet(packet: bytes):
         return None
 
     encoder_raw = packet[1] | (packet[2] << 8)
+    packed_status = int(packet[7])
+    waypoint_idx = (packed_status >> 4) & 0x0F
+    state_enum = packed_status & 0x0F
     beacon1 = packet[8] | (packet[9] << 8)
     beacon2 = packet[10] | (packet[11] << 8)
     beacon3 = packet[12] | (packet[13] << 8)
@@ -282,7 +294,10 @@ def parse_telemetry_packet(packet: bytes):
         "roll_deg": signed_byte_to_int(packet[4]),
         "pitch_deg": signed_byte_to_int(packet[5]),
         "yaw_deg": yaw_byte_to_deg(packet[6]),
-        "waypoint_idx": int(packet[7]),
+        "waypoint_idx": waypoint_idx,
+        "robot_state_code": state_enum,
+        "robot_state": STATE_ENUM_MAP.get(state_enum, f"UNKNOWN_{state_enum}"),
+        "robot_state_enum": STATE_ENUM_MAP.get(state_enum, f"UNKNOWN_{state_enum}"),
         "beacon_1_cm": int(beacon1),
         "beacon_2_cm": int(beacon2),
         "beacon_3_cm": int(beacon3),
@@ -399,10 +414,14 @@ def main():
                 break
 
             incoming = ser.read(ser.in_waiting or 1)
+            active_control = command_state.get()
+
+            published_telemetry = []
             for packet in telemetry_parser.push(incoming):
                 telemetry = parse_telemetry_packet(packet)
-                if telemetry is not None and mqtt_client is not None:
-                    mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry))
+                if telemetry is None:
+                    continue
+                published_telemetry.append(telemetry)
 
             screen_center = (frame.shape[1] / 2.0, frame.shape[0] / 2.0)
 
@@ -423,7 +442,11 @@ def main():
             )
 
             marker_corners, marker_ids = detect_markers(frame, aruco, dictionary, params, detector)
-            active_control = command_state.get()
+
+            if mqtt_client is not None:
+                for telemetry in published_telemetry:
+                    mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry))
+
             sent_this_frame = False
 
             if marker_ids is not None and len(marker_ids) > 0:
