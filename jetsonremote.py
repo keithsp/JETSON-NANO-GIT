@@ -37,6 +37,15 @@ COMMAND_TABLE = {
     "BACKWARD": (0x12, b"BW"),
     "LEFT": (0x13, b"LT"),
     "RIGHT": (0x14, b"RT"),
+    "TURRET_UP": (0x21, b"TU"),
+    "TURRET_DOWN": (0x22, b"TD"),
+    "TURRET_LEFT": (0x23, b"TL"),
+    "TURRET_RIGHT": (0x24, b"TR"),
+    "TRIGGER": (0x31, b"FG"),
+    "RETRIEVAL_IN": (0x41, b"RI"),
+    "RETRIEVAL_OUT": (0x42, b"RO"),
+    "AUTO_MODE": (0x51, b"AU"),
+    "MANUAL_MODE": (0x52, b"MN"),
 }
 
 # Accept both WASD and arrow-key style command tokens from MQTT.
@@ -54,6 +63,25 @@ MQTT_COMMAND_ALIASES = {
     "STOP": "STOP",
     "NONE": "STOP",
 }
+
+MOVEMENT_PRIORITY = (
+    ("forward", "FORWARD"),
+    ("backward", "BACKWARD"),
+    ("left", "LEFT"),
+    ("right", "RIGHT"),
+)
+
+TURRET_PRIORITY = (
+    ("up", "TURRET_UP"),
+    ("down", "TURRET_DOWN"),
+    ("left", "TURRET_LEFT"),
+    ("right", "TURRET_RIGHT"),
+)
+
+RETRIEVAL_PRIORITY = (
+    ("in", "RETRIEVAL_IN"),
+    ("out", "RETRIEVAL_OUT"),
+)
 
 
 class CommandState:
@@ -75,16 +103,53 @@ def parse_command_text(payload_text: str) -> str:
     if not text:
         return "STOP"
 
-    # Support JSON payload from dashboard: {"command":"FORWARD", ...}
     if text.startswith("{") and text.endswith("}"):
         try:
             data = json.loads(text)
             if isinstance(data, dict):
-                text = str(data.get("command", "")).strip()
+                return parse_command_payload(data)
         except json.JSONDecodeError:
             return "STOP"
 
     return MQTT_COMMAND_ALIASES.get(text.upper(), "STOP")
+
+
+def first_active(group, priority_pairs):
+    if not isinstance(group, dict):
+        return None
+    for key, command_name in priority_pairs:
+        if group.get(key):
+            return command_name
+    return None
+
+
+def parse_command_payload(data: dict) -> str:
+    text_command = str(data.get("command", "")).strip()
+    if text_command:
+        return MQTT_COMMAND_ALIASES.get(text_command.upper(), "STOP")
+
+    movement_command = first_active(data.get("movement"), MOVEMENT_PRIORITY)
+    if movement_command is not None:
+        return movement_command
+
+    turret_command = first_active(data.get("turret"), TURRET_PRIORITY)
+    if turret_command is not None:
+        return turret_command
+
+    if data.get("trigger"):
+        return "TRIGGER"
+
+    retrieval_command = first_active(data.get("retrieval"), RETRIEVAL_PRIORITY)
+    if retrieval_command is not None:
+        return retrieval_command
+
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode == "auto":
+        return "AUTO_MODE"
+    if mode == "manual":
+        return "MANUAL_MODE"
+
+    return "STOP"
 
 
 def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, command_name: str) -> bytes:
