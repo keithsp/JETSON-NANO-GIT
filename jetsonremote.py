@@ -11,7 +11,8 @@ import serial
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUDRATE = 115200
 
-CAMERA_INDEX = 0
+AIMING_CAMERA_INDEX = 0
+AUX_CAMERA_INDEX = 1
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 490
 OBJ_WIDTH = 400
@@ -21,6 +22,7 @@ MQTT_BROKER = "192.168.137.1"
 MQTT_PORT = 1883
 MQTT_TOPIC_COMMAND = "sep3/robot/cmd"
 MQTT_TOPIC_CAMERA = "sep3/robot/camera"
+MQTT_TOPIC_CAMERA_AUX = "sep3/robot/camera2"
 MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
 CAMERA_STREAM_FPS = 10.0
 CAMERA_JPEG_QUALITY = 70
@@ -409,28 +411,48 @@ def main():
         dsrdtr=False,
     )
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
+    aiming_cap = cv2.VideoCapture(AIMING_CAMERA_INDEX)
+    if not aiming_cap.isOpened():
         ser.close()
-        raise RuntimeError("Error: Could not open the webcam!")
+        raise RuntimeError("Error: Could not open the aiming camera!")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    aux_cap = cv2.VideoCapture(AUX_CAMERA_INDEX)
+    if not aux_cap.isOpened():
+        print("Warning: Could not open the auxiliary camera.")
+        aux_cap.release()
+        aux_cap = None
 
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Actual resolution: {actual_width}x{actual_height}")
-    print("Starting ArUco marker detection with center calculation + MQTT command tail...")
+    aiming_cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    aiming_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+    if aux_cap is not None:
+        aux_cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        aux_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+    actual_width = int(aiming_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(aiming_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Aiming camera resolution: {actual_width}x{actual_height}")
+    if aux_cap is not None:
+        aux_width = int(aux_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        aux_height = int(aux_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Aux camera resolution: {aux_width}x{aux_height}")
+    print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
     print("Press 'q' to stop")
 
     aruco, dictionary, params, detector = get_aruco_detector()
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = aiming_cap.read()
             if not ok or frame is None:
-                print("Error: Could not grab a frame!")
+                print("Error: Could not grab a frame from the aiming camera!")
                 break
+
+            aux_frame = None
+            if aux_cap is not None:
+                aux_ok, aux_frame = aux_cap.read()
+                if not aux_ok or aux_frame is None:
+                    aux_frame = None
 
             incoming = ser.read(ser.in_waiting or 1)
             active_control = command_state.get()
@@ -517,6 +539,10 @@ def main():
                     camera_payload = encode_camera_frame(frame)
                     if camera_payload is not None:
                         mqtt_client.publish(MQTT_TOPIC_CAMERA, camera_payload)
+                    if aux_frame is not None:
+                        aux_payload = encode_camera_frame(aux_frame)
+                        if aux_payload is not None:
+                            mqtt_client.publish(MQTT_TOPIC_CAMERA_AUX, aux_payload)
                         last_camera_publish_time = now
 
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
@@ -524,7 +550,9 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        cap.release()
+        aiming_cap.release()
+        if aux_cap is not None:
+            aux_cap.release()
         cv2.destroyAllWindows()
         ser.close()
         if mqtt_client is not None:
