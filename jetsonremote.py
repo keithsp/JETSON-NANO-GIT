@@ -392,11 +392,26 @@ def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: 
     fps_int = max(1, int(round(fps)))
     pipeline_candidates = [
         (
-            "nvv4l2h264enc",
+            "nvv4l2h264enc-bgrx-nv12",
             "appsrc is-live=true do-timestamp=true format=time ! "
+            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
+            "videoconvert ! "
+            "video/x-raw,format=BGRx ! "
+            "nvvidconv ! "
+            "video/x-raw(memory:NVMM),format=NV12 ! "
+            f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
+            "h264parse ! "
+            "rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={host} port={port} sync=false async=false"
+        ),
+        (
+            "nvv4l2h264enc-i420",
+            "appsrc is-live=true do-timestamp=true format=time ! "
+            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
             "videoconvert ! "
             f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
             f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
             "h264parse ! "
             "rtph264pay config-interval=1 pt=96 ! "
@@ -405,9 +420,10 @@ def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: 
         (
             "omxh264enc",
             "appsrc is-live=true do-timestamp=true format=time ! "
+            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
             "videoconvert ! "
             f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
             f"omxh264enc bitrate={H264_BITRATE} control-rate=variable ! "
             "h264parse ! "
             "rtph264pay config-interval=1 pt=96 ! "
@@ -416,9 +432,10 @@ def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: 
         (
             "x264enc",
             "appsrc is-live=true do-timestamp=true format=time ! "
+            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
             "videoconvert ! "
             f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
             f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={max(1, H264_BITRATE // 1000)} key-int-max=30 ! "
             "h264parse ! "
             "rtph264pay config-interval=1 pt=96 ! "
