@@ -102,6 +102,7 @@ class CommandState:
             "turret_bits": 0,
             "aux_bits": 0,
             "label": "STOP",
+            "selected_target_id": None,
         }
 
     def set(self, value: dict):
@@ -119,6 +120,7 @@ def command_to_state(command_name: str) -> dict:
         "turret_bits": 0,
         "aux_bits": 0,
         "label": command_name,
+        "selected_target_id": None,
     }
 
     if command_name == "FORWARD":
@@ -177,6 +179,14 @@ def parse_command_payload(data: dict) -> str:
     movement_bits = int(data.get("movement_bits", 0)) & 0xFF
     turret_bits = int(data.get("turret_bits", 0)) & 0xFF
     aux_bits = int(data.get("aux_bits", 0)) & 0xFF
+    selected_target_id = data.get("selected_target_id")
+    if selected_target_id in {"", "--"}:
+        selected_target_id = None
+    elif selected_target_id is not None:
+        try:
+            selected_target_id = int(selected_target_id)
+        except (TypeError, ValueError):
+            selected_target_id = None
 
     if movement_bits or turret_bits or aux_bits:
         labels = []
@@ -209,6 +219,7 @@ def parse_command_payload(data: dict) -> str:
             "turret_bits": turret_bits,
             "aux_bits": aux_bits,
             "label": "+".join(labels) if labels else "STOP",
+            "selected_target_id": selected_target_id,
         }
 
     text_command = str(data.get("command", "")).strip()
@@ -232,9 +243,13 @@ def parse_command_payload(data: dict) -> str:
 
     mode = str(data.get("mode", "")).strip().lower()
     if mode == "auto":
-        return command_to_state("AUTO_MODE")
+        state = command_to_state("AUTO_MODE")
+        state["selected_target_id"] = selected_target_id
+        return state
 
-    return command_to_state("STOP")
+    state = command_to_state("STOP")
+    state["selected_target_id"] = selected_target_id
+    return state
 
 
 def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, control_state: dict) -> bytes:
@@ -383,10 +398,46 @@ def encode_camera_frame(frame) -> Optional[bytes]:
     return encoded.tobytes()
 
 
+def build_target_records(marker_corners, marker_ids):
+    records = []
+    if marker_ids is None or len(marker_ids) == 0:
+        return records
+
+    for i, marker_id in enumerate(marker_ids.flatten()):
+        corners = marker_corners[i].reshape((4, 2))
+        cx = int(float(corners[:, 0].mean()))
+        cy = int(float(corners[:, 1].mean()))
+        records.append(
+            {
+                "id": int(marker_id),
+                "corners": corners,
+                "cx": cx,
+                "cy": cy,
+            }
+        )
+
+    records.sort(key=lambda record: record["id"])
+    return records
+
+
+def choose_active_target(records, selected_target_id):
+    if not records:
+        return None
+    if selected_target_id is not None:
+        for record in records:
+            if record["id"] == selected_target_id:
+                return record
+    return records[0]
+
+
 def main():
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
     last_camera_publish_time = 0.0
+    latest_telemetry = {
+        "robot_state": STATE_MANUAL,
+        "robot_state_enum": STATE_MANUAL,
+    }
 
     def on_connect(client, userdata, flags, reason_code, properties):
         print(f"MQTT connected, reason code: {reason_code}")
@@ -472,6 +523,7 @@ def main():
                 if telemetry is None:
                     continue
                 published_telemetry.append(telemetry)
+                latest_telemetry.update(telemetry)
 
             screen_center = (frame.shape[1] / 2.0, frame.shape[0] / 2.0)
 
@@ -492,41 +544,67 @@ def main():
             )
 
             marker_corners, marker_ids = detect_markers(frame, aruco, dictionary, params, detector)
-
-            if mqtt_client is not None:
-                for telemetry in published_telemetry:
-                    mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry))
+            target_records = build_target_records(marker_corners, marker_ids)
+            selected_target_id = active_control.get("selected_target_id")
+            active_target = choose_active_target(target_records, selected_target_id)
 
             sent_this_frame = False
 
-            if marker_ids is not None and len(marker_ids) > 0:
-                aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
+            if target_records:
+                for i, record in enumerate(target_records):
+                    corners = record["corners"].astype(int)
+                    is_selected = selected_target_id is not None and record["id"] == selected_target_id
+                    is_active = active_target is not None and record["id"] == active_target["id"]
 
-                for i, marker_id in enumerate(marker_ids.flatten()):
-                    corners = marker_corners[i].reshape((4, 2))
-                    cx = int(float(corners[:, 0].mean()))
-                    cy = int(float(corners[:, 1].mean()))
+                    color = (0, 180, 255)
+                    if is_selected and is_active:
+                        color = (0, 255, 0)
+                    elif is_active:
+                        color = (0, 255, 255)
+                    elif is_selected:
+                        color = (255, 0, 255)
 
-                    cv2.line(
+                    for idx in range(4):
+                        start = tuple(corners[idx])
+                        end = tuple(corners[(idx + 1) % 4])
+                        cv2.line(frame, start, end, color, 2)
+
+                    cv2.circle(frame, (record["cx"], record["cy"]), 8, color, -1)
+                    label = f"ID:{record['id']}"
+                    if is_active:
+                        label += " ACTIVE"
+                    elif is_selected:
+                        label += " SELECTED"
+                    cv2.putText(
                         frame,
-                        (int(screen_center[0]), int(screen_center[1])),
-                        (cx, cy),
-                        (255, 255, 0),
+                        label,
+                        (record["cx"] + 10, record["cy"] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        color,
                         2,
                     )
-                    cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
 
-                    packet = build_uart_message(cx, cy, OBJ_WIDTH, OBJ_HEIGHT, active_control)
+                    if active_target is not None and record["id"] == active_target["id"]:
+                        cv2.line(
+                            frame,
+                            (int(screen_center[0]), int(screen_center[1])),
+                            (record["cx"], record["cy"]),
+                            color,
+                            2,
+                        )
+
+                if active_target is not None:
+                    packet = build_uart_message(active_target["cx"], active_target["cy"], OBJ_WIDTH, OBJ_HEIGHT, active_control)
                     ser.write(packet)
                     sent_this_frame = True
 
-                    info_text = (
-                        f"ID:{int(marker_id)} Center:({cx},{cy}) "
-                        f"M:{active_control['movement_bits']:02X} "
-                        f"T:{active_control['turret_bits']:02X} "
-                        f"A:{active_control['aux_bits']:02X}"
-                    )
-                    cv2.putText(frame, info_text, (40, 50 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                info_text = (
+                    f"VISIBLE:{','.join(str(record['id']) for record in target_records)} "
+                    f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'} "
+                    f"ACT:{active_target['id'] if active_target is not None else '--'}"
+                )
+                cv2.putText(frame, info_text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
             else:
                 cv2.putText(frame, "No markers detected", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -538,11 +616,23 @@ def main():
                 f"M:{active_control['movement_bits']:02X} "
                 f"T:{active_control['turret_bits']:02X} "
                 f"A:{active_control['aux_bits']:02X} "
-                f"{active_control['label']}"
+                f"{active_control['label']} "
+                f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'}"
             )
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
             if mqtt_client is not None:
+                telemetry_snapshot = dict(latest_telemetry)
+                telemetry_snapshot.update(
+                    {
+                        "visible_targets": [record["id"] for record in target_records],
+                        "target_count": len(target_records),
+                        "selected_target_id": selected_target_id,
+                        "active_target_id": active_target["id"] if active_target is not None else None,
+                    }
+                )
+                mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
+
                 now = time.time()
                 if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
                     camera_payload = encode_camera_frame(frame)
