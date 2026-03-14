@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from typing import Optional
 
 import cv2
 import paho.mqtt.client as mqtt
@@ -361,7 +362,7 @@ def detect_markers(frame, aruco, dictionary, params, detector):
     return corners, ids
 
 
-def encode_camera_frame(frame) -> bytes | None:
+def encode_camera_frame(frame) -> Optional[bytes]:
     ok, encoded = cv2.imencode(
         ".jpg",
         frame,
