@@ -33,7 +33,7 @@ CONTROL_MSG_TYPE = 0x01
 CONTROL_MSG_END = 0x31
 
 JETSON_STATUS_STX = 0xAA
-JETSON_STATUS_PKT_SIZE = 15
+JETSON_STATUS_PKT_SIZE = 23
 
 ROSM_MOVE_FORWARD = 0x01
 ROSM_MOVE_BACKWARD = 0x02
@@ -296,6 +296,10 @@ def parse_telemetry_packet(packet: bytes):
     beacon1 = packet[8] | (packet[9] << 8)
     beacon2 = packet[10] | (packet[11] << 8)
     beacon3 = packet[12] | (packet[13] << 8)
+    usonic1 = packet[14] | (packet[15] << 8)
+    usonic2 = packet[16] | (packet[17] << 8)
+    usonic3 = packet[18] | (packet[19] << 8)
+    usonic4 = packet[20] | (packet[21] << 8)
 
     return {
         "encoder_deg": round(encoder_raw / 10.0, 1),
@@ -310,7 +314,11 @@ def parse_telemetry_packet(packet: bytes):
         "beacon_1_cm": int(beacon1),
         "beacon_2_cm": int(beacon2),
         "beacon_3_cm": int(beacon3),
-        "checksum": int(packet[14]),
+        "us_1_cm": int(usonic1),
+        "us_2_cm": int(usonic2),
+        "us_3_cm": int(usonic3),
+        "us_4_cm": int(usonic4),
+        "checksum": int(packet[22]),
         "timestamp": time.time(),
     }
 
