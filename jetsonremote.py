@@ -26,6 +26,7 @@ MQTT_TOPIC_CAMERA_AUX = "sep3/robot/camera2"
 MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
 CAMERA_STREAM_FPS = 10.0
 CAMERA_JPEG_QUALITY = 70
+AUX_CAMERA_RETRY_SECONDS = 2.0
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -407,6 +408,25 @@ def encode_camera_frame(frame) -> Optional[bytes]:
     return encoded.tobytes()
 
 
+def open_camera_capture(camera_index: int, label: str, required: bool) -> Optional[cv2.VideoCapture]:
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        message = f"Could not open the {label} camera at index {camera_index}."
+        if required:
+            cap.release()
+            raise RuntimeError(f"Error: {message}")
+        print(f"Warning: {message}")
+        cap.release()
+        return None
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"{label.capitalize()} camera resolution: {width}x{height}")
+    return cap
+
+
 def build_target_records(marker_corners, marker_ids):
     records = []
     if marker_ids is None or len(marker_ids) == 0:
@@ -479,31 +499,9 @@ def main():
         dsrdtr=False,
     )
 
-    aiming_cap = cv2.VideoCapture(AIMING_CAMERA_INDEX)
-    if not aiming_cap.isOpened():
-        ser.close()
-        raise RuntimeError("Error: Could not open the aiming camera!")
-
-    aux_cap = cv2.VideoCapture(AUX_CAMERA_INDEX)
-    if not aux_cap.isOpened():
-        print("Warning: Could not open the auxiliary camera.")
-        aux_cap.release()
-        aux_cap = None
-
-    aiming_cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    aiming_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    if aux_cap is not None:
-        aux_cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        aux_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    actual_width = int(aiming_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(aiming_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Aiming camera resolution: {actual_width}x{actual_height}")
-    if aux_cap is not None:
-        aux_width = int(aux_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        aux_height = int(aux_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Aux camera resolution: {aux_width}x{aux_height}")
+    aiming_cap = open_camera_capture(AIMING_CAMERA_INDEX, "aiming", required=True)
+    aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
+    next_aux_retry_time = 0.0
 
     print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
     print("Press 'q' to stop")
@@ -518,10 +516,18 @@ def main():
                 break
 
             aux_frame = None
+            now = time.time()
+            if aux_cap is None and now >= next_aux_retry_time:
+                aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
+                next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
             if aux_cap is not None:
                 aux_ok, aux_frame = aux_cap.read()
                 if not aux_ok or aux_frame is None:
+                    print("Warning: Auxiliary camera frame grab failed. Retrying...")
+                    aux_cap.release()
+                    aux_cap = None
                     aux_frame = None
+                    next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
 
             incoming = ser.read(ser.in_waiting or 1)
             active_control = command_state.get()
@@ -642,7 +648,6 @@ def main():
                 )
                 mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
 
-                now = time.time()
                 if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
                     camera_payload = encode_camera_frame(frame)
                     if camera_payload is not None:
