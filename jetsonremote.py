@@ -390,17 +390,50 @@ def encode_camera_frame(frame) -> Optional[bytes]:
 
 def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: float):
     fps_int = max(1, int(round(fps)))
-    pipeline = (
-        "appsrc ! "
-        "videoconvert ! "
-        f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-        "queue ! "
-        f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
-        "h264parse ! "
-        "rtph264pay config-interval=1 pt=96 ! "
-        f"udpsink host={host} port={port} sync=false async=false"
-    )
-    return cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (width, height), True)
+    pipeline_candidates = [
+        (
+            "nvv4l2h264enc",
+            "appsrc is-live=true do-timestamp=true format=time ! "
+            "videoconvert ! "
+            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
+            f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
+            "h264parse ! "
+            "rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={host} port={port} sync=false async=false"
+        ),
+        (
+            "omxh264enc",
+            "appsrc is-live=true do-timestamp=true format=time ! "
+            "videoconvert ! "
+            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
+            f"omxh264enc bitrate={H264_BITRATE} control-rate=variable ! "
+            "h264parse ! "
+            "rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={host} port={port} sync=false async=false"
+        ),
+        (
+            "x264enc",
+            "appsrc is-live=true do-timestamp=true format=time ! "
+            "videoconvert ! "
+            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
+            "queue ! "
+            f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={max(1, H264_BITRATE // 1000)} key-int-max=30 ! "
+            "h264parse ! "
+            "rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={host} port={port} sync=false async=false"
+        ),
+    ]
+
+    for encoder_name, pipeline in pipeline_candidates:
+        writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (width, height), True)
+        if writer.isOpened():
+            print(f"H.264 stream writer opened with {encoder_name} on UDP port {port}.")
+            return writer
+
+    print(f"Warning: No H.264 stream writer pipeline could be opened for UDP port {port}.")
+    return None
 
 
 def main():
