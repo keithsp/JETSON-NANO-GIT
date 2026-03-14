@@ -24,7 +24,12 @@ MQTT_TOPIC_COMMAND = "sep3/robot/cmd"
 MQTT_TOPIC_CAMERA = "sep3/robot/camera"
 MQTT_TOPIC_CAMERA_AUX = "sep3/robot/camera2"
 MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
-CAMERA_STREAM_FPS = 10.0
+H264_STREAM_TARGET_HOST = MQTT_BROKER
+AIMING_CAMERA_STREAM_PORT = 5600
+AUX_CAMERA_STREAM_PORT = 5601
+H264_STREAM_FPS = 15.0
+H264_BITRATE = 2000000
+MQTT_CAMERA_FALLBACK_FPS = 2.0
 CAMERA_JPEG_QUALITY = 70
 
 CONTROL_MSG_LEN = 15
@@ -383,10 +388,25 @@ def encode_camera_frame(frame) -> Optional[bytes]:
     return encoded.tobytes()
 
 
+def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: float):
+    fps_int = max(1, int(round(fps)))
+    pipeline = (
+        "appsrc ! "
+        "videoconvert ! "
+        f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
+        "queue ! "
+        f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
+        "h264parse ! "
+        "rtph264pay config-interval=1 pt=96 ! "
+        f"udpsink host={host} port={port} sync=false async=false"
+    )
+    return cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (width, height), True)
+
+
 def main():
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
-    last_camera_publish_time = 0.0
+    last_mqtt_camera_publish_time = 0.0
 
     def on_connect(client, userdata, flags, reason_code, properties):
         print(f"MQTT connected, reason code: {reason_code}")
@@ -444,6 +464,33 @@ def main():
         aux_width = int(aux_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         aux_height = int(aux_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"Aux camera resolution: {aux_width}x{aux_height}")
+
+    aiming_stream = open_h264_stream_writer(
+        H264_STREAM_TARGET_HOST,
+        AIMING_CAMERA_STREAM_PORT,
+        FRAME_WIDTH,
+        FRAME_HEIGHT,
+        H264_STREAM_FPS,
+    )
+    if not aiming_stream.isOpened():
+        print("Warning: Could not open H.264 stream writer for aiming camera.")
+        aiming_stream.release()
+        aiming_stream = None
+
+    aux_stream = None
+    if aux_cap is not None:
+        aux_stream = open_h264_stream_writer(
+            H264_STREAM_TARGET_HOST,
+            AUX_CAMERA_STREAM_PORT,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
+            H264_STREAM_FPS,
+        )
+        if not aux_stream.isOpened():
+            print("Warning: Could not open H.264 stream writer for auxiliary camera.")
+            aux_stream.release()
+            aux_stream = None
+
     print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
     print("Press 'q' to stop")
 
@@ -541,9 +588,14 @@ def main():
             )
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
+            if aiming_stream is not None:
+                aiming_stream.write(frame)
+            if aux_stream is not None and aux_frame is not None:
+                aux_stream.write(aux_frame)
+
             if mqtt_client is not None:
                 now = time.time()
-                if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
+                if now - last_mqtt_camera_publish_time >= (1.0 / MQTT_CAMERA_FALLBACK_FPS):
                     camera_payload = encode_camera_frame(frame)
                     if camera_payload is not None:
                         mqtt_client.publish(MQTT_TOPIC_CAMERA, camera_payload)
@@ -551,7 +603,7 @@ def main():
                         aux_payload = encode_camera_frame(aux_frame)
                         if aux_payload is not None:
                             mqtt_client.publish(MQTT_TOPIC_CAMERA_AUX, aux_payload)
-                        last_camera_publish_time = now
+                    last_mqtt_camera_publish_time = now
 
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
@@ -561,6 +613,10 @@ def main():
         aiming_cap.release()
         if aux_cap is not None:
             aux_cap.release()
+        if aiming_stream is not None:
+            aiming_stream.release()
+        if aux_stream is not None:
+            aux_stream.release()
         cv2.destroyAllWindows()
         ser.close()
         if mqtt_client is not None:
