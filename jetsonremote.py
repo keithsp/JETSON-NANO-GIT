@@ -49,6 +49,7 @@ ROSM_AUX_TRIGGER = 0x01
 ROSM_AUX_RETRIEVAL_IN = 0x02
 ROSM_AUX_RETRIEVAL_OUT = 0x04
 ROSM_AUX_AUTO_MODE = 0x08
+ROSM_AUX_TARGETING_ENABLE = 0x10
 
 STATE_MANUAL = "MANUAL"
 STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
@@ -147,6 +148,13 @@ def command_to_state(command_name: str) -> dict:
         state["aux_bits"] = ROSM_AUX_RETRIEVAL_OUT
     elif command_name == "AUTO_MODE":
         state["aux_bits"] = ROSM_AUX_AUTO_MODE
+    elif command_name == "TARGETING_ENABLE":
+        state["aux_bits"] = ROSM_AUX_TARGETING_ENABLE
+    return state
+
+
+def apply_selected_fields(state: dict, selected_target_id) -> dict:
+    state["selected_target_id"] = selected_target_id
     return state
 
 
@@ -214,6 +222,8 @@ def parse_command_payload(data: dict) -> str:
             labels.append("RETRIEVAL_OUT")
         if aux_bits & ROSM_AUX_AUTO_MODE:
             labels.append("AUTO_MODE")
+        if aux_bits & ROSM_AUX_TARGETING_ENABLE:
+            labels.append("TARGETING_ENABLE")
         return {
             "movement_bits": movement_bits,
             "turret_bits": turret_bits,
@@ -224,32 +234,31 @@ def parse_command_payload(data: dict) -> str:
 
     text_command = str(data.get("command", "")).strip()
     if text_command:
-        return command_to_state(MQTT_COMMAND_ALIASES.get(text_command.upper(), "STOP"))
+        return apply_selected_fields(
+            command_to_state(MQTT_COMMAND_ALIASES.get(text_command.upper(), "STOP")),
+            selected_target_id,
+        )
 
     movement_command = first_active(data.get("movement"), MOVEMENT_PRIORITY)
     if movement_command is not None:
-        return command_to_state(movement_command)
+        return apply_selected_fields(command_to_state(movement_command), selected_target_id)
 
     turret_command = first_active(data.get("turret"), TURRET_PRIORITY)
     if turret_command is not None:
-        return command_to_state(turret_command)
+        return apply_selected_fields(command_to_state(turret_command), selected_target_id)
 
     if data.get("trigger"):
-        return command_to_state("TRIGGER")
+        return apply_selected_fields(command_to_state("TRIGGER"), selected_target_id)
 
     retrieval_command = first_active(data.get("retrieval"), RETRIEVAL_PRIORITY)
     if retrieval_command is not None:
-        return command_to_state(retrieval_command)
+        return apply_selected_fields(command_to_state(retrieval_command), selected_target_id)
 
     mode = str(data.get("mode", "")).strip().lower()
     if mode == "auto":
-        state = command_to_state("AUTO_MODE")
-        state["selected_target_id"] = selected_target_id
-        return state
+        return apply_selected_fields(command_to_state("AUTO_MODE"), selected_target_id)
 
-    state = command_to_state("STOP")
-    state["selected_target_id"] = selected_target_id
-    return state
+    return apply_selected_fields(command_to_state("STOP"), selected_target_id)
 
 
 def build_uart_message(cx: int, cy: int, obj_width: int, obj_height: int, control_state: dict) -> bytes:
