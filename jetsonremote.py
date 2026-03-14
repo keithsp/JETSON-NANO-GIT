@@ -24,12 +24,7 @@ MQTT_TOPIC_COMMAND = "sep3/robot/cmd"
 MQTT_TOPIC_CAMERA = "sep3/robot/camera"
 MQTT_TOPIC_CAMERA_AUX = "sep3/robot/camera2"
 MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
-H264_STREAM_TARGET_HOST = MQTT_BROKER
-AIMING_CAMERA_STREAM_PORT = 5600
-AUX_CAMERA_STREAM_PORT = 5601
-H264_STREAM_FPS = 15.0
-H264_BITRATE = 2000000
-MQTT_CAMERA_FALLBACK_FPS = 2.0
+CAMERA_STREAM_FPS = 10.0
 CAMERA_JPEG_QUALITY = 70
 
 CONTROL_MSG_LEN = 15
@@ -388,75 +383,10 @@ def encode_camera_frame(frame) -> Optional[bytes]:
     return encoded.tobytes()
 
 
-def open_h264_stream_writer(host: str, port: int, width: int, height: int, fps: float):
-    fps_int = max(1, int(round(fps)))
-    pipeline_candidates = [
-        (
-            "nvv4l2h264enc-bgrx-nv12",
-            "appsrc is-live=true do-timestamp=true format=time ! "
-            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
-            "videoconvert ! "
-            "video/x-raw,format=BGRx ! "
-            "nvvidconv ! "
-            "video/x-raw(memory:NVMM),format=NV12 ! "
-            f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
-            "h264parse ! "
-            "rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={host} port={port} sync=false async=false"
-        ),
-        (
-            "nvv4l2h264enc-i420",
-            "appsrc is-live=true do-timestamp=true format=time ! "
-            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
-            "videoconvert ! "
-            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            f"nvv4l2h264enc bitrate={H264_BITRATE} insert-sps-pps=true idrinterval=30 iframeinterval=30 ! "
-            "h264parse ! "
-            "rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={host} port={port} sync=false async=false"
-        ),
-        (
-            "omxh264enc",
-            "appsrc is-live=true do-timestamp=true format=time ! "
-            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
-            "videoconvert ! "
-            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            f"omxh264enc bitrate={H264_BITRATE} control-rate=variable ! "
-            "h264parse ! "
-            "rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={host} port={port} sync=false async=false"
-        ),
-        (
-            "x264enc",
-            "appsrc is-live=true do-timestamp=true format=time ! "
-            f"video/x-raw,format=BGR,width={width},height={height},framerate={fps_int}/1 ! "
-            "queue ! "
-            "videoconvert ! "
-            f"video/x-raw,format=I420,width={width},height={height},framerate={fps_int}/1 ! "
-            f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={max(1, H264_BITRATE // 1000)} key-int-max=30 ! "
-            "h264parse ! "
-            "rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={host} port={port} sync=false async=false"
-        ),
-    ]
-
-    for encoder_name, pipeline in pipeline_candidates:
-        writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (width, height), True)
-        if writer.isOpened():
-            print(f"H.264 stream writer opened with {encoder_name} on UDP port {port}.")
-            return writer
-
-    print(f"Warning: No H.264 stream writer pipeline could be opened for UDP port {port}.")
-    return None
-
-
 def main():
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
-    last_mqtt_camera_publish_time = 0.0
+    last_camera_publish_time = 0.0
 
     def on_connect(client, userdata, flags, reason_code, properties):
         print(f"MQTT connected, reason code: {reason_code}")
@@ -514,32 +444,6 @@ def main():
         aux_width = int(aux_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         aux_height = int(aux_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"Aux camera resolution: {aux_width}x{aux_height}")
-
-    aiming_stream = open_h264_stream_writer(
-        H264_STREAM_TARGET_HOST,
-        AIMING_CAMERA_STREAM_PORT,
-        FRAME_WIDTH,
-        FRAME_HEIGHT,
-        H264_STREAM_FPS,
-    )
-    if not aiming_stream.isOpened():
-        print("Warning: Could not open H.264 stream writer for aiming camera.")
-        aiming_stream.release()
-        aiming_stream = None
-
-    aux_stream = None
-    if aux_cap is not None:
-        aux_stream = open_h264_stream_writer(
-            H264_STREAM_TARGET_HOST,
-            AUX_CAMERA_STREAM_PORT,
-            FRAME_WIDTH,
-            FRAME_HEIGHT,
-            H264_STREAM_FPS,
-        )
-        if not aux_stream.isOpened():
-            print("Warning: Could not open H.264 stream writer for auxiliary camera.")
-            aux_stream.release()
-            aux_stream = None
 
     print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
     print("Press 'q' to stop")
@@ -638,14 +542,9 @@ def main():
             )
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
-            if aiming_stream is not None:
-                aiming_stream.write(frame)
-            if aux_stream is not None and aux_frame is not None:
-                aux_stream.write(aux_frame)
-
             if mqtt_client is not None:
                 now = time.time()
-                if now - last_mqtt_camera_publish_time >= (1.0 / MQTT_CAMERA_FALLBACK_FPS):
+                if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
                     camera_payload = encode_camera_frame(frame)
                     if camera_payload is not None:
                         mqtt_client.publish(MQTT_TOPIC_CAMERA, camera_payload)
@@ -653,7 +552,7 @@ def main():
                         aux_payload = encode_camera_frame(aux_frame)
                         if aux_payload is not None:
                             mqtt_client.publish(MQTT_TOPIC_CAMERA_AUX, aux_payload)
-                    last_mqtt_camera_publish_time = now
+                    last_camera_publish_time = now
 
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
@@ -663,10 +562,6 @@ def main():
         aiming_cap.release()
         if aux_cap is not None:
             aux_cap.release()
-        if aiming_stream is not None:
-            aiming_stream.release()
-        if aux_stream is not None:
-            aux_stream.release()
         cv2.destroyAllWindows()
         ser.close()
         if mqtt_client is not None:
