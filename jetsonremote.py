@@ -19,7 +19,10 @@ OBJ_HEIGHT = 400
 MQTT_BROKER = "192.168.137.1"
 MQTT_PORT = 1883
 MQTT_TOPIC_COMMAND = "sep3/robot/cmd"
+MQTT_TOPIC_CAMERA = "sep3/robot/camera"
 MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
+CAMERA_STREAM_FPS = 10.0
+CAMERA_JPEG_QUALITY = 70
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -269,7 +272,10 @@ def signed_byte_to_int(value: int) -> int:
 
 
 def yaw_byte_to_deg(value: int) -> float:
-    return round((float(value) * 360.0) / 255.0, 1)
+    yaw_deg = (float(value) * 360.0) / 255.0
+    if yaw_deg > 180.0:
+        yaw_deg -= 360.0
+    return round(yaw_deg, 1)
 
 
 def parse_telemetry_packet(packet: bytes):
@@ -355,9 +361,21 @@ def detect_markers(frame, aruco, dictionary, params, detector):
     return corners, ids
 
 
+def encode_camera_frame(frame) -> bytes | None:
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(CAMERA_JPEG_QUALITY)],
+    )
+    if not ok:
+        return None
+    return encoded.tobytes()
+
+
 def main():
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
+    last_camera_publish_time = 0.0
 
     def on_connect(client, userdata, flags, reason_code, properties):
         print(f"MQTT connected, reason code: {reason_code}")
@@ -491,6 +509,15 @@ def main():
                 f"{active_control['label']}"
             )
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
+
+            if mqtt_client is not None:
+                now = time.time()
+                if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
+                    camera_payload = encode_camera_frame(frame)
+                    if camera_payload is not None:
+                        mqtt_client.publish(MQTT_TOPIC_CAMERA, camera_payload)
+                        last_camera_publish_time = now
+
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
