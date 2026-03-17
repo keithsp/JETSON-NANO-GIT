@@ -299,13 +299,6 @@ def signed_byte_to_int(value: int) -> int:
     return value - 256 if value > 127 else value
 
 
-def yaw_byte_to_deg(value: int) -> float:
-    yaw_deg = (float(value) * 360.0) / 255.0
-    if yaw_deg > 180.0:
-        yaw_deg -= 360.0
-    return round(yaw_deg, 1)
-
-
 def parse_telemetry_packet(packet: bytes):
     if len(packet) != JETSON_STATUS_PKT_SIZE:
         return None
@@ -331,7 +324,7 @@ def parse_telemetry_packet(packet: bytes):
         "tilt_deg": int(packet[3]),
         "roll_deg": signed_byte_to_int(packet[4]),
         "pitch_deg": signed_byte_to_int(packet[5]),
-        "yaw_deg": yaw_byte_to_deg(packet[6]),
+        "yaw_deg": signed_byte_to_int(packet[6]),
         "waypoint_idx": waypoint_idx,
         "robot_state_code": state_enum,
         "robot_state": STATE_ENUM_MAP.get(state_enum, f"UNKNOWN_{state_enum}"),
