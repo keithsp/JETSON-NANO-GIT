@@ -27,6 +27,13 @@ MQTT_TOPIC_TELEMETRY = "sep3/robot/telemetry"
 CAMERA_STREAM_FPS = 10.0
 CAMERA_JPEG_QUALITY = 70
 AUX_CAMERA_RETRY_SECONDS = 2.0
+TELEMETRY_PUBLISH_INTERVAL_SECONDS = 0.2
+
+LIDAR_SERIAL_PORT = "/dev/ttyUSB0"
+LIDAR_SERIAL_BAUDRATE = 230400
+LIDAR_PACKET_LEN = 47
+LIDAR_POINTS_PER_PACKET = 12
+LIDAR_MAX_DISTANCE_CM = 500
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -114,6 +121,109 @@ class CommandState:
     def get(self) -> dict:
         with self._lock:
             return dict(self._state)
+
+
+class LidarReader:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._scan = [None] * 360
+        self._scan_time = [0.0] * 360
+        self._buffer = bytearray()
+        self._serial = None
+        self._thread = None
+        self._running = False
+
+    def start(self):
+        try:
+            self._serial = serial.Serial(
+                port=LIDAR_SERIAL_PORT,
+                baudrate=LIDAR_SERIAL_BAUDRATE,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.05,
+            )
+        except serial.SerialException as exc:
+            print(f"LiDAR disabled: {exc}")
+            self._serial = None
+            return
+
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        print(f"LiDAR reader started on {LIDAR_SERIAL_PORT} @ {LIDAR_SERIAL_BAUDRATE}")
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except serial.SerialException:
+                pass
+
+    def get_scan_snapshot(self):
+        now = time.time()
+        with self._lock:
+            return [
+                value if value is not None and (now - stamp) <= 1.0 else None
+                for value, stamp in zip(self._scan, self._scan_time)
+            ]
+
+    def _read_loop(self):
+        while self._running and self._serial is not None:
+            try:
+                chunk = self._serial.read(256)
+            except serial.SerialException as exc:
+                print(f"LiDAR read error: {exc}")
+                break
+
+            if not chunk:
+                continue
+
+            self._buffer.extend(chunk)
+            self._consume_packets()
+
+    def _consume_packets(self):
+        while len(self._buffer) >= LIDAR_PACKET_LEN:
+            if self._buffer[0] != 0x54:
+                del self._buffer[0]
+                continue
+            if self._buffer[1] != 0x2C:
+                del self._buffer[0]
+                continue
+
+            packet = bytes(self._buffer[:LIDAR_PACKET_LEN])
+            del self._buffer[:LIDAR_PACKET_LEN]
+            self._update_scan_from_packet(packet)
+
+    def _update_scan_from_packet(self, packet: bytes):
+        start_angle = ((packet[5] << 8) | packet[4]) / 100.0
+        end_angle = ((packet[43] << 8) | packet[42]) / 100.0
+        angle_span = end_angle - start_angle
+        if angle_span < 0.0:
+            angle_span += 360.0
+
+        now = time.time()
+        with self._lock:
+            for index in range(LIDAR_POINTS_PER_PACKET):
+                offset = 6 + (index * 3)
+                distance_mm = packet[offset] | (packet[offset + 1] << 8)
+                if distance_mm <= 0:
+                    continue
+
+                distance_cm = int(round(distance_mm / 10.0))
+                if distance_cm > 5000:
+                    continue
+
+                if LIDAR_POINTS_PER_PACKET > 1:
+                    angle = (start_angle + (angle_span * index / (LIDAR_POINTS_PER_PACKET - 1))) % 360.0
+                else:
+                    angle = start_angle % 360.0
+                degree = int(round(angle)) % 360
+                self._scan[degree] = distance_cm
+                self._scan_time[degree] = now
 
 
 def command_to_state(command_name: str) -> dict:
@@ -456,9 +566,12 @@ def main():
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
     last_camera_publish_time = 0.0
+    last_telemetry_publish_time = 0.0
+    lidar_reader = LidarReader()
     latest_telemetry = {
         "robot_state": STATE_MANUAL,
         "robot_state_enum": STATE_MANUAL,
+        "lidar_scan": [None] * 360,
     }
 
     def on_connect(client, userdata, flags, reason_code, properties):
@@ -495,6 +608,7 @@ def main():
     aiming_cap = open_camera_capture(AIMING_CAMERA_INDEX, "aiming", required=True)
     aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
     next_aux_retry_time = 0.0
+    lidar_reader.start()
 
     print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
     print("Press 'q' to stop")
@@ -525,12 +639,10 @@ def main():
             incoming = ser.read(ser.in_waiting or 1)
             active_control = command_state.get()
 
-            published_telemetry = []
             for packet in telemetry_parser.push(incoming):
                 telemetry = parse_telemetry_packet(packet)
                 if telemetry is None:
                     continue
-                published_telemetry.append(telemetry)
                 latest_telemetry.update(telemetry)
 
             screen_center = (frame.shape[1] / 2.0, frame.shape[0] / 2.0)
@@ -630,16 +742,19 @@ def main():
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
             if mqtt_client is not None:
-                telemetry_snapshot = dict(latest_telemetry)
-                telemetry_snapshot.update(
-                    {
-                        "visible_targets": [record["id"] for record in target_records],
-                        "target_count": len(target_records),
-                        "selected_target_id": selected_target_id,
-                        "active_target_id": active_target["id"] if active_target is not None else None,
-                    }
-                )
-                mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
+                if now - last_telemetry_publish_time >= TELEMETRY_PUBLISH_INTERVAL_SECONDS:
+                    telemetry_snapshot = dict(latest_telemetry)
+                    telemetry_snapshot.update(
+                        {
+                            "visible_targets": [record["id"] for record in target_records],
+                            "target_count": len(target_records),
+                            "selected_target_id": selected_target_id,
+                            "active_target_id": active_target["id"] if active_target is not None else None,
+                            "lidar_scan": lidar_reader.get_scan_snapshot(),
+                        }
+                    )
+                    mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
+                    last_telemetry_publish_time = now
 
                 if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
                     camera_payload = encode_camera_frame(frame)
@@ -656,6 +771,7 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
+        lidar_reader.stop()
         aiming_cap.release()
         if aux_cap is not None:
             aux_cap.release()
